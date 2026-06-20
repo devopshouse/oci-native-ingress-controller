@@ -88,6 +88,7 @@ const (
 	IngressHealthCheckForcePlainTextAnnotation       = "oci-native-ingress.oraclecloud.com/healthcheck-force-plaintext"
 	IngressHttpListenerPortAnnotation                = "oci-native-ingress.oraclecloud.com/http-listener-port"
 	IngressHttpsListenerPortAnnotation               = "oci-native-ingress.oraclecloud.com/https-listener-port"
+	IngressForceSSLRedirectAnnotation                = "oci-native-ingress.oraclecloud.com/force-ssl-redirect"
 
 	// Explicit JSON annotations (preferred) for cookie persistence.
 	// Exactly one should be set for a given ingress/backend-set.
@@ -115,6 +116,7 @@ const (
 	WrapperClient                   = "wrapperClient"
 	CertificateResourcePrefix       = "oci-nic"
 	CertificateHashTagKey           = "oci-native-ingress-controller-certificate-hash"
+	CertificateCommonNameTagKey     = "oci-native-ingress-controller-certificate-cn"
 	CaBundleHashTagKey              = "oci-native-ingress-controller-ca-bundle-hash"
 )
 
@@ -172,6 +174,26 @@ func GetIngressPolicy(i *networkingv1.Ingress) string {
 	}
 
 	return value
+}
+
+func GetIngressForceSSLRedirect(i *networkingv1.Ingress) bool {
+	annotation := IngressForceSSLRedirectAnnotation
+	value, ok := i.Annotations[annotation]
+	if !ok || strings.TrimSpace(value) == "" {
+		return false
+	}
+
+	result, err := strconv.ParseBool(value)
+	if err != nil {
+		klog.Errorf("Error parsing value %s for flag %s as boolean. Setting the default value as 'false'", value, annotation)
+		return false
+	}
+
+	return result
+}
+
+func GenerateSSLRedirectRuleSetName(listenerPort int32) string {
+	return fmt.Sprintf("ssl_redirect_%d", listenerPort)
 }
 
 func GetIngressClassWafPolicy(ic *networkingv1.IngressClass) string {
@@ -959,6 +981,8 @@ func DetermineListenerPort(ingress *networkingv1.Ingress, tlsConfiguredHosts *se
 	if isCertOcidPresent || tlsConfiguredHosts.Has(host) {
 		if annotatedHttpsPort != ZeroPort {
 			listenerPort = int32(annotatedHttpsPort)
+		} else if GetIngressForceSSLRedirect(ingress) {
+			listenerPort = 443
 		}
 	} else if annotatedHttpPort != ZeroPort {
 		listenerPort = int32(annotatedHttpPort)

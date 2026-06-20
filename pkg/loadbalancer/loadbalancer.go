@@ -695,7 +695,7 @@ func (lbc *LoadBalancerClient) setRoutingPolicyOnListener(
 }
 
 func (lbc *LoadBalancerClient) UpdateListener(ctx context.Context, lbId *string, etag string, l loadbalancer.Listener, routingPolicyName *string,
-	sslConfigurationDetails *loadbalancer.SslConfigurationDetails, protocol *string, defaultBackendSet *string) error {
+	sslConfigurationDetails *loadbalancer.SslConfigurationDetails, protocol *string, defaultBackendSet *string, ruleSetNames ...[]string) error {
 
 	if sslConfigurationDetails == nil && l.SslConfiguration != nil {
 		sslConfigurationDetails = &loadbalancer.SslConfigurationDetails{
@@ -715,6 +715,11 @@ func (lbc *LoadBalancerClient) UpdateListener(ctx context.Context, lbId *string,
 		sslConfigurationDetails.CipherSuiteName = common.String(util.ProtocolHTTP2DefaultCipherSuite)
 	}
 
+	listenerRuleSetNames := l.RuleSetNames
+	if len(ruleSetNames) > 0 {
+		listenerRuleSetNames = ruleSetNames[0]
+	}
+
 	updateListenerRequest := loadbalancer.UpdateListenerRequest{
 		IfMatch:        common.String(etag),
 		LoadBalancerId: lbId,
@@ -725,6 +730,7 @@ func (lbc *LoadBalancerClient) UpdateListener(ctx context.Context, lbId *string,
 			DefaultBackendSetName: defaultBackendSet,
 			SslConfiguration:      sslConfigurationDetails,
 			RoutingPolicyName:     routingPolicyName,
+			RuleSetNames:          listenerRuleSetNames,
 		},
 	}
 
@@ -764,7 +770,7 @@ func (lbc *LoadBalancerClient) UpdateListener(ctx context.Context, lbId *string,
 }
 
 func (lbc *LoadBalancerClient) CreateListener(ctx context.Context, lbID string, listenerPort int, listenerProtocol string,
-	defaultBackendSet string, sslConfig *loadbalancer.SslConfigurationDetails) error {
+	defaultBackendSet string, sslConfig *loadbalancer.SslConfigurationDetails, ruleSetNames ...[]string) error {
 
 	lb, _, err := lbc.GetLoadBalancer(ctx, lbID)
 	if err != nil {
@@ -795,6 +801,7 @@ func (lbc *LoadBalancerClient) CreateListener(ctx context.Context, lbID string, 
 			Protocol:              common.String(listenerProtocol),
 			Name:                  common.String(listenerName),
 			SslConfiguration:      sslConfig,
+			RuleSetNames:          optionalRuleSetNames(ruleSetNames...),
 		},
 	}
 
@@ -847,4 +854,63 @@ func (lbc *LoadBalancerClient) waitForWorkRequest(ctx context.Context, workReque
 
 		time.Sleep(10 * time.Second)
 	}
+}
+
+func optionalRuleSetNames(ruleSetNames ...[]string) []string {
+	if len(ruleSetNames) == 0 {
+		return nil
+	}
+	return ruleSetNames[0]
+}
+
+func (lbc *LoadBalancerClient) EnsureRuleSet(ctx context.Context, lbID string, ruleSetName string, rules []loadbalancer.Rule) error {
+	lb, etag, err := lbc.GetLoadBalancer(ctx, lbID)
+	if err != nil {
+		return err
+	}
+
+	actual, found := lb.RuleSets[ruleSetName]
+	if !found {
+		createRuleSetRequest := loadbalancer.CreateRuleSetRequest{
+			LoadBalancerId: lb.Id,
+			CreateRuleSetDetails: loadbalancer.CreateRuleSetDetails{
+				Name:  common.String(ruleSetName),
+				Items: rules,
+			},
+		}
+		klog.Infof("Creating rule set with request: %s", util.PrettyPrint(createRuleSetRequest))
+		resp, err := lbc.LbClient.CreateRuleSet(ctx, createRuleSetRequest)
+		if util.IsServiceError(err, 409) {
+			klog.Infof("Create rule set operation returned code %d for load balancer %s. Rule set %s may be already present.", 409, lbID, ruleSetName)
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		_, err = lbc.waitForWorkRequest(ctx, *resp.OpcWorkRequestId)
+		return err
+	}
+
+	if reflect.DeepEqual(actual.Items, rules) {
+		return nil
+	}
+
+	updateRuleSetRequest := loadbalancer.UpdateRuleSetRequest{
+		IfMatch:        common.String(etag),
+		LoadBalancerId: lb.Id,
+		RuleSetName:    common.String(ruleSetName),
+		UpdateRuleSetDetails: loadbalancer.UpdateRuleSetDetails{
+			Items: rules,
+		},
+	}
+	klog.Infof("Updating rule set with request: %s", util.PrettyPrint(updateRuleSetRequest))
+	resp, err := lbc.LbClient.UpdateRuleSet(ctx, updateRuleSetRequest)
+	if util.IsServiceError(err, 412) {
+		return exception.NewTransientError(fmt.Errorf("unable to update rule set %s for LB %s due to EtagMismatch", ruleSetName, *lb.Id))
+	}
+	if err != nil {
+		return err
+	}
+	_, err = lbc.waitForWorkRequest(ctx, *resp.OpcWorkRequestId)
+	return err
 }

@@ -10,6 +10,8 @@
 package state
 
 import (
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"reflect"
 
@@ -38,14 +40,16 @@ const (
 )
 
 type TlsConfig struct {
-	Artifact string
-	Type     string
+	Artifact   string
+	Type       string
+	CommonName string
 }
 
 type StateStore struct {
 	IngressClassLister networkinglisters.IngressClassLister
 	IngressLister      networkinglisters.IngressLister
 	ServiceLister      corelisters.ServiceLister
+	SecretLister       corelisters.SecretLister
 	IngressGroupState  IngressClassState
 	IngressState       map[string]IngressState
 	metricsCollector   *metric.IngressCollector
@@ -61,6 +65,7 @@ type IngressClassState struct {
 	ListenerProtocolMap             map[int32]string
 	ListenerTLSConfigMap            map[int32]TlsConfig
 	ListenerDefaultBsMap            map[int32]string
+	HTTPRedirectPortMap             map[int32]int32
 }
 
 type IngressState struct {
@@ -80,11 +85,16 @@ type SessionPersistence struct {
 
 func NewStateStore(ingressClassLister networkinglisters.IngressClassLister,
 	ingressLister networkinglisters.IngressLister,
-	serviceLister corelisters.ServiceLister, collector *metric.IngressCollector) *StateStore {
+	serviceLister corelisters.ServiceLister, collector *metric.IngressCollector, secretLister ...corelisters.SecretLister) *StateStore {
+	var sl corelisters.SecretLister
+	if len(secretLister) > 0 {
+		sl = secretLister[0]
+	}
 	return &StateStore{
 		IngressClassLister: ingressClassLister,
 		IngressLister:      ingressLister,
 		ServiceLister:      serviceLister,
+		SecretLister:       sl,
 		IngressGroupState:  IngressClassState{},
 		IngressState:       map[string]IngressState{},
 		metricsCollector:   collector,
@@ -114,6 +124,7 @@ func (s *StateStore) BuildState(ingressClass *networkingv1.IngressClass) error {
 	listenerProtocolMap := make(map[int32]string)
 	listenerTLSConfigMap := make(map[int32]TlsConfig)
 	listenerDefaultBsMap := make(map[int32]string)
+	httpRedirectPortMap := make(map[int32]int32)
 	bsHealthCheckerMap := make(map[string]*ociloadbalancer.HealthCheckerDetails)
 	bsPolicyMap := make(map[string]string)
 	bsSessionPersistenceMap := make(map[string]SessionPersistence)
@@ -196,9 +207,25 @@ func (s *StateStore) BuildState(ingressClass *networkingv1.IngressClass) error {
 					return err
 				}
 
-				err = validateTlsConfig(ing, listenerPort, bsName, host, listenerTLSConfigMap, bsTLSConfigMap, hostSecretMap)
+				err = validateTlsConfig(ing, listenerPort, bsName, host, listenerTLSConfigMap, bsTLSConfigMap, hostSecretMap, s.SecretLister)
 				if err != nil {
 					return err
+				}
+
+				if util.GetIngressForceSSLRedirect(ing) && (tlsConfiguredHosts.Has(host) || util.GetListenerTlsCertificateOcid(ing) != nil) {
+					redirectPort, err := util.GetIngressHttpListenerPort(ing)
+					if err != nil {
+						return fmt.Errorf("error parsing Ingress Http Listener Port: %w", err)
+					}
+					if redirectPort == util.ZeroPort {
+						redirectPort = 80
+					}
+					redirectListenerPort := int32(redirectPort)
+					desiredPorts.Insert(redirectListenerPort)
+					allListeners.Insert(redirectListenerPort)
+					listenerProtocolMap[redirectListenerPort] = util.ProtocolHTTP
+					listenerDefaultBsMap[redirectListenerPort] = util.DefaultBackendSetName
+					httpRedirectPortMap[redirectListenerPort] = listenerPort
 				}
 			}
 		}
@@ -219,6 +246,7 @@ func (s *StateStore) BuildState(ingressClass *networkingv1.IngressClass) error {
 		ListenerProtocolMap:             listenerProtocolMap,
 		ListenerTLSConfigMap:            listenerTLSConfigMap,
 		ListenerDefaultBsMap:            listenerDefaultBsMap,
+		HTTPRedirectPortMap:             httpRedirectPortMap,
 	}
 
 	klog.Infof("Ingress Group state %s, Ingress state %s", util.PrettyPrint(s.IngressGroupState), util.PrettyPrint(s.IngressState))
@@ -232,7 +260,7 @@ func (s *StateStore) BuildState(ingressClass *networkingv1.IngressClass) error {
 }
 
 func validateTlsConfig(ingress *networkingv1.Ingress, listenerPort int32, bsName string, host string, listenerTLSConfigMap map[int32]TlsConfig,
-	bsTLSConfigMap map[string]TlsConfig, hostSecretMap map[string]string) error {
+	bsTLSConfigMap map[string]TlsConfig, hostSecretMap map[string]string, secretLister corelisters.SecretLister) error {
 	bsTLSEnabled := util.GetBackendTlsEnabled(ingress)
 	certificateId := util.GetListenerTlsCertificateOcid(ingress)
 
@@ -245,8 +273,9 @@ func validateTlsConfig(ingress *networkingv1.Ingress, listenerPort int32, bsName
 			}
 		}
 		config := TlsConfig{
-			Type:     ArtifactTypeCertificate,
-			Artifact: *certificateId,
+			Type:       ArtifactTypeCertificate,
+			Artifact:   *certificateId,
+			CommonName: *certificateId,
 		}
 		listenerTLSConfigMap[listenerPort] = config
 		updateBackendTlsStatus(bsTLSEnabled, bsTLSConfigMap, bsName, config)
@@ -256,18 +285,25 @@ func validateTlsConfig(ingress *networkingv1.Ingress, listenerPort int32, bsName
 		secretName, ok := hostSecretMap[host]
 
 		if ok && secretName != "" {
+			commonName, err := getSecretCommonName(ingress.Namespace, secretName, secretLister)
+			if err != nil {
+				return err
+			}
 			tlsPortDetail, ok := listenerTLSConfigMap[listenerPort]
 			if ok {
-				err := validatePortInUse(tlsPortDetail, secretName, nil, listenerPort)
+				err := validatePortInUse(tlsPortDetail, secretName, nil, listenerPort, commonName)
 				if err != nil {
 					return errors.Wrap(err, "validating secrets")
 				}
 			}
 			config := TlsConfig{
-				Type:     ArtifactTypeSecret,
-				Artifact: secretName,
+				Type:       ArtifactTypeSecret,
+				Artifact:   secretName,
+				CommonName: commonName,
 			}
-			listenerTLSConfigMap[listenerPort] = config
+			if _, exists := listenerTLSConfigMap[listenerPort]; !exists {
+				listenerTLSConfigMap[listenerPort] = config
+			}
 			updateBackendTlsStatus(bsTLSEnabled, bsTLSConfigMap, bsName, config)
 		}
 	}
@@ -463,9 +499,22 @@ func (s *StateStore) GetAllListenersForIngressClass() sets.Int32 {
 	return s.IngressGroupState.Listeners
 }
 
-func validatePortInUse(listenerTLSConfig TlsConfig, secretName string, certificateId *string, servicePort int32) error {
+func (s *StateStore) GetSSLRedirectTargetPort(listenerPort int32) (int32, bool) {
+	targetPort, ok := s.IngressGroupState.HTTPRedirectPortMap[listenerPort]
+	return targetPort, ok
+}
+
+func validatePortInUse(listenerTLSConfig TlsConfig, secretName string, certificateId *string, servicePort int32, commonName ...string) error {
 	existing := listenerTLSConfig.Artifact
 	artifactType := listenerTLSConfig.Type
+	newCommonName := ""
+	if len(commonName) > 0 {
+		newCommonName = commonName[0]
+	}
+	if artifactType == ArtifactTypeSecret && secretName != "" && existing != "" && existing != secretName &&
+		listenerTLSConfig.CommonName != "" && newCommonName != "" && listenerTLSConfig.CommonName == newCommonName {
+		return nil
+	}
 	if (artifactType == ArtifactTypeSecret && certificateId != nil) ||
 		(artifactType == ArtifactTypeCertificate && secretName != "") ||
 		(artifactType == ArtifactTypeSecret && existing != "" && existing != secretName) ||
@@ -473,4 +522,27 @@ func validatePortInUse(listenerTLSConfig TlsConfig, secretName string, certifica
 		return fmt.Errorf(PortConflictMessage, servicePort)
 	}
 	return nil
+}
+
+func (s *StateStore) getSecretCommonName(namespace string, secretName string) (string, error) {
+	return getSecretCommonName(namespace, secretName, s.SecretLister)
+}
+
+func getSecretCommonName(namespace string, secretName string, secretLister corelisters.SecretLister) (string, error) {
+	if secretLister == nil {
+		return "", nil
+	}
+	secret, err := secretLister.Secrets(namespace).Get(secretName)
+	if err != nil {
+		return "", fmt.Errorf("unable to GET secret %s/%s: %w", namespace, secretName, err)
+	}
+	block, _ := pem.Decode(secret.Data["tls.crt"])
+	if block == nil {
+		return "", fmt.Errorf("unable to parse leaf certificate for secret %s/%s", namespace, secretName)
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", fmt.Errorf("unable to parse leaf certificate for secret %s/%s: %w", namespace, secretName, err)
+	}
+	return cert.Subject.CommonName, nil
 }

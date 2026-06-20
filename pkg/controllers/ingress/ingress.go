@@ -28,6 +28,7 @@ import (
 	"github.com/pkg/errors"
 	"k8s.io/klog/v2"
 
+	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-native-ingress-controller/pkg/loadbalancer"
 	"github.com/oracle/oci-native-ingress-controller/pkg/metric"
 	"github.com/oracle/oci-native-ingress-controller/pkg/state"
@@ -375,7 +376,7 @@ func (c *Controller) ensureIngress(ctx context.Context, ingress *networkingv1.In
 		certificateCompartmentId = util.GetIngressClassCompartmentId(ingressClassParameters, c.defaultCompartmentId)
 	}
 
-	stateStore := state.NewStateStore(c.ingressClassLister, c.ingressLister, c.serviceLister, c.metricsCollector)
+	stateStore := state.NewStateStore(c.ingressClassLister, c.ingressLister, c.serviceLister, c.metricsCollector, c.secretLister)
 	ingressConfigError := stateStore.BuildState(ingressClass)
 
 	if ingressConfigError != nil {
@@ -462,7 +463,11 @@ func (c *Controller) ensureIngress(ctx context.Context, ingress *networkingv1.In
 
 		protocol := stateStore.GetListenerProtocol(port)
 		defaultBackendSet := stateStore.GetListenerDefaultBackendSet(port)
-		err = wrapperClient.GetLbClient().CreateListener(context.TODO(), lbId, int(port), protocol, defaultBackendSet, listenerSslConfig)
+		ruleSetNames, err := ensureSSLRedirectRuleSet(context.TODO(), wrapperClient.GetLbClient(), lbId, stateStore, port)
+		if err != nil {
+			return err
+		}
+		err = wrapperClient.GetLbClient().CreateListener(context.TODO(), lbId, int(port), protocol, defaultBackendSet, listenerSslConfig, ruleSetNames)
 		if err != nil {
 			return err
 		}
@@ -487,7 +492,7 @@ func (c *Controller) ensureIngress(ctx context.Context, ingress *networkingv1.In
 }
 
 func handleIngressDelete(ctx context.Context, c *Controller, ingressClass *networkingv1.IngressClass) error {
-	stateStore := state.NewStateStore(c.ingressClassLister, c.ingressLister, c.serviceLister, c.metricsCollector)
+	stateStore := state.NewStateStore(c.ingressClassLister, c.ingressLister, c.serviceLister, c.metricsCollector, c.secretLister)
 	ingressConfigError := stateStore.BuildState(ingressClass)
 
 	if ingressConfigError != nil {
@@ -610,8 +615,18 @@ func syncListener(ctx context.Context, namespace string, stateStore *state.State
 		needsUpdate = true
 	}
 
+	expectedRuleSetNames := desiredSSLRedirectRuleSetNames(stateStore, int32(*listener.Port))
+	if !stringSlicesEqual(listener.RuleSetNames, expectedRuleSetNames) {
+		klog.Infof("Rule sets for listener %s need update, new rule sets %s", *listener.Name, util.PrettyPrint(expectedRuleSetNames))
+		needsUpdate = true
+	}
+
 	if needsUpdate {
-		err := wrapperClient.GetLbClient().UpdateListener(context.TODO(), lbId, etag, listener, listener.RoutingPolicyName, sslConfig, &protocol, &defaultBackendSet)
+		ruleSetNames, err := ensureSSLRedirectRuleSet(context.TODO(), wrapperClient.GetLbClient(), *lbId, stateStore, int32(*listener.Port))
+		if err != nil {
+			return err
+		}
+		err = wrapperClient.GetLbClient().UpdateListener(context.TODO(), lbId, etag, listener, listener.RoutingPolicyName, sslConfig, &protocol, &defaultBackendSet, ruleSetNames)
 		if err != nil {
 			return err
 		}
@@ -621,6 +636,54 @@ func syncListener(ctx context.Context, namespace string, stateStore *state.State
 		c.metricsCollector.AddIngressListenerSyncTime(util.GetTimeDifferenceInSeconds(startTime, endTime))
 	}
 	return nil
+}
+
+func ensureSSLRedirectRuleSet(ctx context.Context, lbClient *loadbalancer.LoadBalancerClient, lbId string, stateStore *state.StateStore, listenerPort int32) ([]string, error) {
+	targetPort, ok := stateStore.GetSSLRedirectTargetPort(listenerPort)
+	if !ok {
+		return nil, nil
+	}
+
+	ruleSetNames := desiredSSLRedirectRuleSetNames(stateStore, listenerPort)
+	rules := []ociloadbalancer.Rule{
+		ociloadbalancer.RedirectRule{
+			Conditions: []ociloadbalancer.RuleCondition{
+				ociloadbalancer.PathMatchCondition{
+					AttributeValue: common.String("/"),
+					Operator:       ociloadbalancer.PathMatchConditionOperatorPrefixMatch,
+				},
+			},
+			ResponseCode: common.Int(301),
+			RedirectUri: &ociloadbalancer.RedirectUri{
+				Protocol: common.String("HTTPS"),
+				Host:     common.String("{host}"),
+				Port:     common.Int(int(targetPort)),
+				Path:     common.String("{path}"),
+				Query:    common.String("{query}"),
+			},
+		},
+	}
+
+	err := lbClient.EnsureRuleSet(ctx, lbId, ruleSetNames[0], rules)
+	if err != nil {
+		return nil, err
+	}
+
+	return ruleSetNames, nil
+}
+
+func desiredSSLRedirectRuleSetNames(stateStore *state.StateStore, listenerPort int32) []string {
+	if _, ok := stateStore.GetSSLRedirectTargetPort(listenerPort); !ok {
+		return nil
+	}
+	return []string{util.GenerateSSLRedirectRuleSetName(listenerPort)}
+}
+
+func stringSlicesEqual(left []string, right []string) bool {
+	if len(left) == 0 && len(right) == 0 {
+		return true
+	}
+	return reflect.DeepEqual(left, right)
 }
 
 func syncBackendSet(ctx context.Context, ingress *networkingv1.Ingress, lbID string, backendSetName string,

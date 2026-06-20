@@ -25,6 +25,8 @@ type LoadBalancerInterface interface {
 	CreateRoutingPolicy(ctx context.Context, request loadbalancer.CreateRoutingPolicyRequest) (loadbalancer.CreateRoutingPolicyResponse, error)
 	UpdateRoutingPolicy(ctx context.Context, request loadbalancer.UpdateRoutingPolicyRequest) (loadbalancer.UpdateRoutingPolicyResponse, error)
 	DeleteRoutingPolicy(ctx context.Context, request loadbalancer.DeleteRoutingPolicyRequest) (loadbalancer.DeleteRoutingPolicyResponse, error)
+	CreateRuleSet(ctx context.Context, request loadbalancer.CreateRuleSetRequest) (loadbalancer.CreateRuleSetResponse, error)
+	UpdateRuleSet(ctx context.Context, request loadbalancer.UpdateRuleSetRequest) (loadbalancer.UpdateRuleSetResponse, error)
 
 	CreateListener(ctx context.Context, request loadbalancer.CreateListenerRequest) (loadbalancer.CreateListenerResponse, error)
 	UpdateListener(ctx context.Context, request loadbalancer.UpdateListenerRequest) (loadbalancer.UpdateListenerResponse, error)
@@ -106,6 +108,16 @@ func (client LBClient) UpdateRoutingPolicy(ctx context.Context,
 func (client LBClient) DeleteRoutingPolicy(ctx context.Context,
 	request loadbalancer.DeleteRoutingPolicyRequest) (loadbalancer.DeleteRoutingPolicyResponse, error) {
 	return client.lbClient.DeleteRoutingPolicy(ctx, request)
+}
+
+func (client LBClient) CreateRuleSet(ctx context.Context,
+	request loadbalancer.CreateRuleSetRequest) (loadbalancer.CreateRuleSetResponse, error) {
+	return client.lbClient.CreateRuleSet(ctx, request)
+}
+
+func (client LBClient) UpdateRuleSet(ctx context.Context,
+	request loadbalancer.UpdateRuleSetRequest) (loadbalancer.UpdateRuleSetResponse, error) {
+	return client.lbClient.UpdateRuleSet(ctx, request)
 }
 
 func (client LBClient) CreateListener(ctx context.Context,

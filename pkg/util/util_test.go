@@ -842,6 +842,12 @@ func TestDetermineListenerPort(t *testing.T) {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(listenerPort).Should(Equal(servicePort))
 
+	annotations[IngressForceSSLRedirectAnnotation] = "true"
+	listenerPort, err = DetermineListenerPort(ingress, &tlsConfiguredHosts, "tls-configured-1", servicePort)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(listenerPort).Should(Equal(httpsPort))
+	delete(annotations, IngressForceSSLRedirectAnnotation)
+
 	annotations[IngressHttpsListenerPortAnnotation] = "443"
 	listenerPort, err = DetermineListenerPort(ingress, &tlsConfiguredHosts, "tls-configured-1", servicePort)
 	Expect(err).NotTo(HaveOccurred())

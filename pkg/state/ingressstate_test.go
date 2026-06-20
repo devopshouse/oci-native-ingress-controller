@@ -10,8 +10,15 @@ package state
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
 	"github.com/oracle/oci-go-sdk/v65/common"
@@ -20,6 +27,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/informers"
 	fakeclientset "k8s.io/client-go/kubernetes/fake"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -62,6 +70,45 @@ func setUp(ctx context.Context, ingressClassList *networkingv1.IngressClassList,
 	cache.WaitForCacheSync(ctx.Done(), ingressInformer.Informer().HasSynced)
 	cache.WaitForCacheSync(ctx.Done(), serviceInformer.Informer().HasSynced)
 	return ingressClassLister, ingressLister, serviceLister
+}
+
+func setUpSecrets(ctx context.Context, secretList *v1.SecretList) corelisters.SecretLister {
+	client := fakeclientset.NewSimpleClientset()
+	util.UpdateFakeClientCall(client, "list", "secrets", secretList)
+
+	informerFactory := informers.NewSharedInformerFactory(client, 0)
+	secretInformer := informerFactory.Core().V1().Secrets()
+	secretLister := secretInformer.Lister()
+
+	informerFactory.Start(ctx.Done())
+	cache.WaitForCacheSync(ctx.Done(), secretInformer.Informer().HasSynced)
+	return secretLister
+}
+
+func sampleTLSSecret(namespace string, name string, commonName string) *v1.Secret {
+	cert := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: commonName,
+		},
+		NotBefore: time.Now(),
+		NotAfter:  time.Now().AddDate(1, 0, 0),
+	}
+	privKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	certBytes, _ := x509.CreateCertificate(rand.Reader, cert, cert, &privKey.PublicKey, privKey)
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certBytes})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privKey)})
+
+	return &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace,
+			Name:      name,
+		},
+		Data: map[string][]byte{
+			"tls.crt": certPEM,
+			"tls.key": keyPEM,
+		},
+	}
 }
 
 func TestListenerWithDifferentSecrets(t *testing.T) {
@@ -111,6 +158,80 @@ func TestListenerWithSameSecrets(t *testing.T) {
 
 	allBs := stateStore.GetAllBackendSetForIngressClass()
 	Expect(len(allBs)).Should(Equal(2))
+}
+
+func TestForceSSLRedirectAddsHttpListener(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassList()
+	ingressList := util.ReadResourceAsIngressList(TlsConfigValidationsFilePath)
+	secretName := "same_secret_name"
+	ingressList.Items[0].Spec.TLS[0].SecretName = secretName
+	ingressList.Items[1].Spec.TLS[0].SecretName = secretName
+	ingressList.Items[0].Annotations = map[string]string{util.IngressForceSSLRedirectAnnotation: "true"}
+	ingressList.Items[1].Annotations = map[string]string{util.IngressForceSSLRedirectAnnotation: "true"}
+
+	testService := util.GetServiceListResource("default", "tls-test", 943)
+	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, testService)
+
+	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil)
+	err := stateStore.BuildState(&ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+	Expect(stateStore.GetIngressPorts(ingressList.Items[0].Name).Has(80)).To(BeTrue())
+	Expect(stateStore.GetIngressPorts(ingressList.Items[0].Name).Has(443)).To(BeTrue())
+	targetPort, ok := stateStore.GetSSLRedirectTargetPort(80)
+	Expect(ok).To(BeTrue())
+	Expect(targetPort).To(Equal(int32(443)))
+}
+
+func TestListenerWithDifferentSecretsSameCommonName(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassList()
+	ingressList := util.ReadResourceAsIngressList(TlsConfigValidationsFilePath)
+	ingressList.Items[0].Spec.TLS[0].SecretName = "wildcard-a"
+	ingressList.Items[1].Spec.TLS[0].SecretName = "wildcard-b"
+
+	testService := util.GetServiceListResource("default", "tls-test", 943)
+	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, testService)
+	secretLister := setUpSecrets(ctx, &v1.SecretList{Items: []v1.Secret{
+		*sampleTLSSecret("default", "wildcard-a", "*.tools.tjpi.jus.br"),
+		*sampleTLSSecret("default", "wildcard-b", "*.tools.tjpi.jus.br"),
+	}})
+
+	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil, secretLister)
+	err := stateStore.BuildState(&ingressClassList.Items[0])
+	Expect(err).NotTo(HaveOccurred())
+	artifact, artifactType := stateStore.GetTLSConfigForListener(943)
+	Expect(sets.NewString("wildcard-a", "wildcard-b").Has(artifact)).To(BeTrue())
+	Expect(artifactType).To(Equal(ArtifactTypeSecret))
+}
+
+func TestListenerWithDifferentSecretsDifferentCommonName(t *testing.T) {
+	RegisterTestingT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ingressClassList := util.GetIngressClassList()
+	ingressList := util.ReadResourceAsIngressList(TlsConfigValidationsFilePath)
+	ingressList.Items[0].Spec.TLS[0].SecretName = "wildcard-a"
+	ingressList.Items[1].Spec.TLS[0].SecretName = "wildcard-b"
+
+	testService := util.GetServiceListResource("default", "tls-test", 943)
+	ingressClassLister, ingressLister, serviceLister := setUp(ctx, ingressClassList, ingressList, testService)
+	secretLister := setUpSecrets(ctx, &v1.SecretList{Items: []v1.Secret{
+		*sampleTLSSecret("default", "wildcard-a", "*.tools.tjpi.jus.br"),
+		*sampleTLSSecret("default", "wildcard-b", "*.other.tjpi.jus.br"),
+	}})
+
+	stateStore := NewStateStore(ingressClassLister, ingressLister, serviceLister, nil, secretLister)
+	err := stateStore.BuildState(&ingressClassList.Items[0])
+	Expect(err).NotTo(BeNil())
+	Expect(err.Error()).Should(ContainSubstring(fmt.Sprintf(PortConflictMessage, 943)))
 }
 
 func TestListenerWithSecretAndCertificate(t *testing.T) {

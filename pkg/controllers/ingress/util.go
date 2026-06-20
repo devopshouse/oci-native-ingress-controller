@@ -13,6 +13,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
@@ -77,6 +78,21 @@ func hashPublicTlsData(data *TLSSecretData) string {
 		concatString = concatString + *data.ServerCertificate
 	}
 	return hashString(&concatString)
+}
+
+func commonNameFromTLSData(data *TLSSecretData) (string, error) {
+	if data == nil || data.ServerCertificate == nil {
+		return "", nil
+	}
+	block, _ := pem.Decode([]byte(*data.ServerCertificate))
+	if block == nil {
+		return "", nil
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", err
+	}
+	return cert.Subject.CommonName, nil
 }
 
 func hashString(data *string) string {
@@ -264,6 +280,22 @@ func ensureCertificateForListener(inputCertificateId string, namespace string, s
 	tlsSecretData, err := getTlsSecretContent(namespace, secretName, secretLister)
 	if err != nil {
 		return "", err
+	}
+
+	secretCommonName, err := commonNameFromTLSData(tlsSecretData)
+	if err != nil {
+		return "", err
+	}
+
+	if inputCertificateId != "" && secretCommonName != "" {
+		cert, _, err := GetCertificate(&inputCertificateId, client.GetCertClient())
+		if err != nil {
+			return "", err
+		}
+		if cert.FreeformTags != nil && cert.FreeformTags[util.CertificateCommonNameTagKey] == secretCommonName {
+			klog.Infof("Reusing listener certificate %s for secret %s with matching CN %s", inputCertificateId, klog.KRef(namespace, secretName), secretCommonName)
+			return inputCertificateId, nil
+		}
 	}
 
 	certificateId, err := VerifyOrGetCertificateIdByName(inputCertificateId, certificateName, compartmentId, client.GetCertClient())

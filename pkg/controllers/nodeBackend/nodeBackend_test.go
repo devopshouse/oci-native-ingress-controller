@@ -444,3 +444,13 @@ func NewMockCacheStore(client *client.WrapperClient) *MockCacheStore {
 func (m *MockCacheStore) GetByKey(key string) (item interface{}, exists bool, err error) {
 	return m.client, true, nil
 }
+
+func (m MockLoadBalancerClient) CreateRuleSet(ctx context.Context, request ociloadbalancer.CreateRuleSetRequest) (ociloadbalancer.CreateRuleSetResponse, error) {
+	id := "id"
+	return ociloadbalancer.CreateRuleSetResponse{OpcWorkRequestId: &id, OpcRequestId: &id}, nil
+}
+
+func (m MockLoadBalancerClient) UpdateRuleSet(ctx context.Context, request ociloadbalancer.UpdateRuleSetRequest) (ociloadbalancer.UpdateRuleSetResponse, error) {
+	id := "id"
+	return ociloadbalancer.UpdateRuleSetResponse{OpcWorkRequestId: &id, OpcRequestId: &id}, nil
+}

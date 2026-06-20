@@ -98,12 +98,18 @@ func CreateImportedTypeCertificate(tlsSecretData *TLSSecretData, certificateName
 		PrivateKeyPem:  tlsSecretData.PrivateKey,
 	}
 
+	commonName, err := commonNameFromTLSData(tlsSecretData)
+	if err != nil {
+		return nil, err
+	}
+
 	certificateDetails := certificatesmanagement.CreateCertificateDetails{
 		Name:              &certificateName,
 		CertificateConfig: configDetails,
 		CompartmentId:     &compartmentId,
 		FreeformTags: map[string]string{
-			util.CertificateHashTagKey: hashPublicTlsData(tlsSecretData),
+			util.CertificateHashTagKey:       hashPublicTlsData(tlsSecretData),
+			util.CertificateCommonNameTagKey: commonName,
 		},
 	}
 	createCertificateRequest := certificatesmanagement.CreateCertificateRequest{
@@ -134,10 +140,16 @@ func UpdateImportedTypeCertificate(certificateId *string, tlsSecretData *TLSSecr
 		PrivateKeyPem:  tlsSecretData.PrivateKey,
 	}
 
+	commonName, err := commonNameFromTLSData(tlsSecretData)
+	if err != nil {
+		return nil, err
+	}
+
 	updateCertificateDetails := certificatesmanagement.UpdateCertificateDetails{
 		CertificateConfig: configDetails,
 		FreeformTags: map[string]string{
-			util.CertificateHashTagKey: hashPublicTlsData(tlsSecretData),
+			util.CertificateHashTagKey:       hashPublicTlsData(tlsSecretData),
+			util.CertificateCommonNameTagKey: commonName,
 		},
 	}
 

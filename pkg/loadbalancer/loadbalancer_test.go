@@ -399,3 +399,13 @@ func (m MockLoadBalancerClient) DeleteListener(ctx context.Context, request ocil
 		OpcRequestId:     &id,
 	}, err
 }
+
+func (m MockLoadBalancerClient) CreateRuleSet(ctx context.Context, request ociloadbalancer.CreateRuleSetRequest) (ociloadbalancer.CreateRuleSetResponse, error) {
+	id := "id"
+	return ociloadbalancer.CreateRuleSetResponse{OpcWorkRequestId: &id, OpcRequestId: &id}, nil
+}
+
+func (m MockLoadBalancerClient) UpdateRuleSet(ctx context.Context, request ociloadbalancer.UpdateRuleSetRequest) (ociloadbalancer.UpdateRuleSetResponse, error) {
+	id := "id"
+	return ociloadbalancer.UpdateRuleSetResponse{OpcWorkRequestId: &id, OpcRequestId: &id}, nil
+}
