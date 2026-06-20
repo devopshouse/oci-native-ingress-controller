@@ -62,7 +62,9 @@ func (lbc *LoadBalancerClient) getFromCache(lbID string) *LbCacheObj {
 func (lbc *LoadBalancerClient) removeFromCache(lbID string) *LbCacheObj {
 	lbc.Mu.Lock()
 	defer lbc.Mu.Unlock()
-	return lbc.Cache[lbID]
+	obj := lbc.Cache[lbID]
+	delete(lbc.Cache, lbID)
+	return obj
 }
 
 func (lbc *LoadBalancerClient) getLoadBalancerBustCache(ctx context.Context, lbID string) (*loadbalancer.LoadBalancer, string, error) {
@@ -526,6 +528,7 @@ func (lbc *LoadBalancerClient) updateRoutingPolicyRules(ctx context.Context, lbI
 	klog.Infof("Updating routing policy with request: %s", util.PrettyPrint(updateRoutingPolicyRequest))
 	resp, err := lbc.LbClient.UpdateRoutingPolicy(ctx, updateRoutingPolicyRequest)
 	if util.IsServiceError(err, 412) {
+		lbc.getLoadBalancerBustCache(ctx, lbID)
 		return exception.NewTransientError(fmt.Errorf("unable to update routing policy %s for LB %s due to EtagMismatch", policyName, *lb.Id))
 	}
 
@@ -647,6 +650,9 @@ func (lbc *LoadBalancerClient) UpdateBackendSet(ctx context.Context, lbID string
 	isTransient, errMsg := util.AsServiceError(err, 409, 412)
 	if isTransient {
 		klog.Errorf("Unable to update BackendSet %s for load balancer %s due to %s", backendSetName, lbID, errMsg)
+		if util.IsServiceError(err, 412) {
+			lbc.getLoadBalancerBustCache(ctx, lbID)
+		}
 		return exception.NewTransientError(err)
 	}
 
@@ -740,6 +746,9 @@ func (lbc *LoadBalancerClient) UpdateListener(ctx context.Context, lbId *string,
 	isTransient, errMsg := util.AsServiceError(err, 404, 409, 412)
 	if isTransient {
 		klog.Errorf("Unable to update Listener %s on load balancer %s due to %s", *l.Name, *lbId, errMsg)
+		if util.IsServiceError(err, 412) {
+			lbc.getLoadBalancerBustCache(ctx, *lbId)
+		}
 		return exception.NewTransientError(err)
 	}
 
